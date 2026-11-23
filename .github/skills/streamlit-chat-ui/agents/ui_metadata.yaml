@@ -1,0 +1,4 @@
+interface:
+  display_name: "Streamlit Chat UI"
+  short_description: "Streamlit Chat UI for the Streamlit PDF chat workflow"
+  brand_color: "#2563EB"

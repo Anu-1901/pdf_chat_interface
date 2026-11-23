@@ -1,0 +1,4 @@
+interface:
+  display_name: "Document Chunking"
+  short_description: "Document Chunking for the Streamlit PDF chat workflow"
+  brand_color: "#2563EB"

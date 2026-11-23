@@ -1,0 +1,4 @@
+interface:
+  display_name: "PDF Question Answering"
+  short_description: "PDF Question Answering for the Streamlit PDF chat workflow"
+  brand_color: "#2563EB"

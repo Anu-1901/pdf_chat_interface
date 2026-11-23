@@ -1,0 +1,4 @@
+interface:
+  display_name: "Source Citation Rendering"
+  short_description: "Source Citation Rendering for the Streamlit PDF chat workflow"
+  brand_color: "#2563EB"

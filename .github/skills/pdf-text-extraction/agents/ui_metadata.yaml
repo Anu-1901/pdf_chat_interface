@@ -1,0 +1,4 @@
+interface:
+  display_name: "PDF Text Extraction"
+  short_description: "PDF Text Extraction for the Streamlit PDF chat workflow"
+  brand_color: "#2563EB"

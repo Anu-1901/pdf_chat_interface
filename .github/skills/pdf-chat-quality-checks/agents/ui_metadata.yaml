@@ -1,0 +1,4 @@
+interface:
+  display_name: "PDF Chat Quality Checks"
+  short_description: "PDF Chat Quality Checks for the Streamlit PDF chat workflow"
+  brand_color: "#2563EB"

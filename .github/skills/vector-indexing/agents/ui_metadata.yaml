@@ -1,0 +1,4 @@
+interface:
+  display_name: "Vector Indexing"
+  short_description: "Vector Indexing for the Streamlit PDF chat workflow"
+  brand_color: "#2563EB"

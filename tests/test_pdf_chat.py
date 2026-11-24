@@ -176,6 +176,10 @@ class PDFChatTests(unittest.TestCase):
             document_bundle_id((("copy.pdf", first_pdf), ("cats.pdf", first_pdf))),
             duplicate_bundle_id,
         )
+        self.assertEqual(
+            document_bundle_id((("cats.pdf", first_pdf), ("CATS.pdf", first_pdf))),
+            document_bundle_id((("CATS.pdf", first_pdf), ("cats.pdf", first_pdf))),
+        )
 
         with self.assertRaises(PDFValidationError):
             prepare_documents(uploads, max_total_bytes=10)

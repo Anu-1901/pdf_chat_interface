@@ -17,6 +17,7 @@ Run at least these cases:
 9. Citation IDs not retrieved, incorrect filenames/pages, and excerpts derived from the wrong source chunk.
 10. Model paraphrases a supporting quote; verify that citation acceptance uses the valid chunk ID and that the displayed quote is still copied from source text.
 11. Repeated questions, Streamlit reruns, removing a file, and reset behavior.
+12. Unauthenticated and unauthorized identities; verify only admins can publish and permitted users can only read/chat.
 
 ## Verify
 - Each citation shows the correct safe filename and 1-based page in that PDF's viewer; each quote is verbatim and exists on that page.
@@ -26,6 +27,7 @@ Run at least these cases:
 - Any selected-set change clears stale history and retrieval state; reordering does not trigger a false change.
 - Secrets and document text are absent from logs.
 - Errors are understandable and recoverable.
+- Unauthenticated users cannot read the shared library; non-admins cannot publish through the UI or storage write API.
 
 ## Output format
 Return a checklist with `PASS`, `FAIL`, or `BLOCKED`, evidence, and the smallest recommended fix. Do not mark the feature complete while citation validation, prompt-injection resistance, or stale-index isolation fails.

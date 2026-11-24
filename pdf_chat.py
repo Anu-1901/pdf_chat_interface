@@ -202,7 +202,7 @@ def prepare_documents(
     seen_document_ids: set[str] = set()
     for document_id, display_name, validated_bytes in sorted(
         validated_uploads,
-        key=lambda item: (item[0], item[1].casefold()),
+        key=lambda item: (item[0], item[1].casefold(), item[1]),
     ):
         if document_id in seen_document_ids:
             duplicate_count += 1
@@ -254,17 +254,25 @@ def prepare_documents(
 
 
 def document_bundle_id(documents: tuple[tuple[str, bytes], ...]) -> str:
+    document_records = tuple(
+        (hashlib.sha256(pdf_bytes).hexdigest(), filename)
+        for filename, pdf_bytes in documents
+    )
+    return document_set_id(document_records)
+
+
+def document_set_id(documents: tuple[tuple[str, str], ...]) -> str:
     unique_documents: dict[str, str] = {}
-    for filename, pdf_bytes in documents:
-        content_id = hashlib.sha256(pdf_bytes).hexdigest()
+    for content_id, filename in documents:
         display_name = safe_display_name(filename)
         current_name = unique_documents.get(content_id)
-        if current_name is None or display_name.casefold() < current_name.casefold():
+        if current_name is None or (display_name.casefold(), display_name) < (
+            current_name.casefold(),
+            current_name,
+        ):
             unique_documents[content_id] = display_name
     signature = json.dumps(
-        sorted(
-            unique_documents.items()
-        ),
+        sorted(unique_documents.items()),
         ensure_ascii=True,
         separators=(",", ":"),
     )

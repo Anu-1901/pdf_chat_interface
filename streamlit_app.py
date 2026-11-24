@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
+import sqlite3
+from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -9,7 +12,15 @@ import openai
 import streamlit as st
 from dotenv import load_dotenv
 from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+from streamlit.errors import StreamlitSecretNotFoundError
 
+from access_control import parse_csv_values, resolve_role
+from document_library import (
+    LibraryDocument,
+    get_documents,
+    list_documents,
+    save_documents,
+)
 from pdf_chat import (
     DEFAULT_CHUNK_OVERLAP,
     DEFAULT_CHUNK_SIZE,
@@ -21,7 +32,7 @@ from pdf_chat import (
     VectorIndex,
     answer_question,
     build_vector_index,
-    document_bundle_id,
+    document_set_id,
     prepare_documents,
 )
 
@@ -183,7 +194,80 @@ def clear_document_state() -> None:
 
 def reset_document() -> None:
     clear_document_state()
-    st.session_state.upload_widget_version += 1
+    st.session_state.selected_document_ids = []
+
+
+def sign_out() -> None:
+    clear_document_state()
+    st.session_state.selected_document_ids = []
+    st.session_state.authenticated_user_email = None
+    st.logout()
+
+
+def configured_oidc_auth() -> bool:
+    try:
+        auth_settings = st.secrets.get("auth", {})
+    except StreamlitSecretNotFoundError:
+        return False
+    required = (
+        "redirect_uri",
+        "cookie_secret",
+        "client_id",
+        "client_secret",
+        "server_metadata_url",
+    )
+    return isinstance(auth_settings, Mapping) and all(
+        isinstance(auth_settings.get(key), str) and auth_settings[key].strip()
+        for key in required
+    )
+
+
+def authenticate_user() -> tuple[str, str, str] | None:
+    if not configured_oidc_auth():
+        st.title("PDF chat sign-in is not configured")
+        st.error(
+            "Configure an OpenID Connect provider in "
+            "`.streamlit/secrets.toml` before users can sign in. See "
+            "`.streamlit/secrets.toml.example`."
+        )
+        return None
+
+    if not st.user.is_logged_in:
+        st.title("Sign in to PDF chat")
+        st.caption("Use your organization account to access the shared PDF library.")
+        if st.button("Sign in", icon=":material/login:", type="primary"):
+            st.login()
+        return None
+
+    email = st.user.get("email")
+    email_verified = st.user.get("email_verified") is True
+    if not email_verified:
+        st.error(
+            "The identity provider must supply a verified email address to access "
+            "the PDF library."
+        )
+        st.button("Sign out", on_click=sign_out)
+        return None
+
+    role = resolve_role(
+        email,
+        parse_csv_values(os.getenv("PDF_CHAT_ADMIN_EMAILS")),
+        parse_csv_values(os.getenv("PDF_CHAT_ALLOWED_EMAILS")),
+        parse_csv_values(os.getenv("PDF_CHAT_ALLOWED_EMAIL_DOMAINS")),
+        email_verified=email_verified,
+    )
+    if role is None:
+        st.title("You are not authorized to use PDF chat")
+        st.error(
+            "Your account is not on the permitted user list. Ask an administrator "
+            "to add your email or organization domain."
+        )
+        st.button("Sign out", on_click=sign_out)
+        return None
+
+    normalized_email = str(email).strip().casefold()
+    display_name = st.user.get("name") or normalized_email
+    return normalized_email, str(display_name), role
 
 
 def render_sources(answer: Answer) -> None:
@@ -215,146 +299,270 @@ def show_processing_error(error: Exception) -> None:
     st.session_state.index = None
 
 
-def process_upload(documents: tuple[tuple[str, bytes], ...], document_id: str) -> None:
-    st.session_state.status = "validating"
-    with st.status("Validating uploaded PDF...", expanded=True) as progress:
-        try:
-            max_upload_mb = float(os.getenv("PDF_MAX_UPLOAD_MB", "25"))
-            max_total_upload_mb = float(
-                os.getenv(
-                    "PDF_MAX_TOTAL_UPLOAD_MB",
-                    str(DEFAULT_MAX_TOTAL_UPLOAD_BYTES / (1024 * 1024)),
-                )
-            )
-            if not 0 < max_upload_mb <= 200 or not 0 < max_total_upload_mb <= 1024:
-                raise ValueError(
-                    "Upload limits must be greater than 0; each PDF is limited to "
-                    "200 MB and the combined upload to 1024 MB."
-                )
-            max_upload_bytes = int(max_upload_mb * 1024 * 1024)
-            bundle_id, document_names, pages, duplicate_count = prepare_documents(
-                documents,
-                max_upload_bytes,
-                int(max_total_upload_mb * 1024 * 1024),
-                MAX_DOCUMENTS_PER_UPLOAD,
-            )
-            if bundle_id != document_id:
-                raise PDFChatError(
-                    "The uploaded file changed while it was being processed."
-                )
+def database_path() -> Path:
+    configured_path = os.getenv("PDF_CHAT_LIBRARY_DB")
+    path = Path(configured_path) if configured_path else Path("data/pdf_chat_library.sqlite3")
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    return path
 
-            st.session_state.document_names = document_names
-            st.session_state.document_name = ", ".join(document_names)
-            st.session_state.status = "extracting"
-            st.session_state.pages = pages
 
-            st.session_state.status = "indexing"
-            progress.update(
-                label=f"Extracted {len(pages)} pages; building the semantic index...",
-                state="running",
+def configured_upload_limits() -> tuple[int, int]:
+    try:
+        max_file_mb = float(os.getenv("PDF_MAX_UPLOAD_MB", "25"))
+        max_total_mb = float(
+            os.getenv(
+                "PDF_MAX_TOTAL_UPLOAD_MB",
+                str(DEFAULT_MAX_TOTAL_UPLOAD_BYTES / (1024 * 1024)),
             )
-            farm = get_farm_settings()
-            page_data = tuple(
-                (
-                    page.document_id,
-                    page.document_name,
-                    page.page_number,
-                    page.text,
-                )
-                for page in pages
+        )
+    except ValueError as exc:
+        raise ValueError("PDF upload limits must be valid numbers.") from exc
+    if not 0 < max_file_mb <= 200 or not 0 < max_total_mb <= 1024:
+        raise ValueError(
+            "Upload limits must be greater than 0; each PDF is limited to "
+            "200 MB and the combined upload to 1024 MB."
+        )
+    return int(max_file_mb * 1024 * 1024), int(max_total_mb * 1024 * 1024)
+
+
+def process_selected_documents(
+    selected_documents: tuple[tuple[str, str, bytes], ...],
+    expected_set_id: str,
+) -> None:
+    st.session_state.status = "extracting"
+    try:
+        max_file_bytes, max_total_bytes = configured_upload_limits()
+        uploads = tuple((name, pdf_bytes) for _, name, pdf_bytes in selected_documents)
+        document_id, document_names, pages, duplicate_count = prepare_documents(
+            uploads,
+            max_file_bytes=max_file_bytes,
+            max_total_bytes=max_total_bytes,
+            max_documents=MAX_DOCUMENTS_PER_UPLOAD,
+        )
+        if document_id != expected_set_id:
+            raise PDFChatError(
+                "A selected PDF changed in the shared library. Refresh and select it again."
             )
-            index = get_document_index(
-                document_id,
-                page_data,
-                farm.base_url,
-                farm.embedding_deployment,
-                farm.embedding_api_version,
-                DEFAULT_CHUNK_SIZE,
-                DEFAULT_CHUNK_OVERLAP,
-                farm.api_key,
+
+        st.session_state.document_names = document_names
+        st.session_state.document_name = ", ".join(document_names)
+        st.session_state.pages = pages
+        st.session_state.status = "indexing"
+
+        farm = get_farm_settings()
+        page_data = tuple(
+            (
+                page.document_id,
+                page.document_name,
+                page.page_number,
+                page.text,
             )
-            st.session_state.index = index
-            st.session_state.chunks = index.chunks
-            st.session_state.status = "ready"
-            st.session_state.error_message = None
-            st.session_state.duplicate_document_count = duplicate_count
-            progress.update(label="PDFs ready", state="complete", expanded=False)
-        except (PDFChatError, ModelConfigurationError, ValueError) as exc:
-            show_processing_error(exc)
-            progress.update(label="PDF processing failed", state="error", expanded=True)
-        except openai.RateLimitError:
-            show_processing_error(
-                PDFChatError(
-                    "Bosch LLM Farm rate limit reached while building the index. "
-                    "Wait briefly, then reset and upload the PDF again."
-                )
+            for page in pages
+        )
+        index = get_document_index(
+            document_id,
+            page_data,
+            farm.base_url,
+            farm.embedding_deployment,
+            farm.embedding_api_version,
+            DEFAULT_CHUNK_SIZE,
+            DEFAULT_CHUNK_OVERLAP,
+            farm.api_key,
+        )
+        st.session_state.index = index
+        st.session_state.chunks = index.chunks
+        st.session_state.status = "ready"
+        st.session_state.error_message = None
+        st.session_state.duplicate_document_count = duplicate_count
+    except (PDFChatError, ModelConfigurationError, ValueError) as exc:
+        show_processing_error(exc)
+    except openai.RateLimitError:
+        show_processing_error(
+            PDFChatError(
+                "Bosch LLM Farm rate limit reached while building the index. "
+                "Wait briefly, then try selecting the PDFs again."
             )
-            progress.update(label="PDF processing failed", state="error", expanded=True)
-        except (httpx.HTTPError, openai.APIError):
-            show_processing_error(
-                PDFChatError(
-                    "Bosch LLM Farm could not build the PDF index. Check the network, "
-                    "deployment settings, and service access, then reset and upload again."
-                )
+        )
+    except (httpx.HTTPError, openai.APIError):
+        show_processing_error(
+            PDFChatError(
+                "Bosch LLM Farm could not build the PDF index. Check the network, "
+                "deployment settings, and service access, then try again."
             )
-            progress.update(label="PDF processing failed", state="error", expanded=True)
+        )
+    except (OSError, sqlite3.Error, LookupError) as exc:
+        show_processing_error(
+            PDFChatError(f"The shared PDF library could not load the selection: {exc}")
+        )
 
 
 st.set_page_config(page_title="PDF chat", page_icon=":material/description:", layout="centered")
 initialize_state()
-st.title("Chat with PDFs")
-st.caption("Upload text-based PDFs and ask questions with exact file and page references.")
+identity = authenticate_user()
+if identity is None:
+    st.stop()
+
+user_email, display_name, role = identity
+if st.session_state.get("authenticated_user_email") != user_email:
+    clear_document_state()
+    st.session_state.authenticated_user_email = user_email
+st.session_state.setdefault("selected_document_ids", [])
+
+st.title("Chat with shared PDFs")
+st.caption("Select PDFs from your organization library and ask questions with exact source references.")
 
 with st.sidebar:
-    st.header("Your document")
-    st.info(
-        "PDF text and your questions are sent to the configured Bosch LLM Farm "
-        "for search and answer generation. Upload only documents you are permitted "
-        "to share with that service."
-    )
-    missing_settings = missing_farm_settings()
-    if missing_settings:
-        st.warning(
-            "Bosch LLM Farm is not ready. Configure the required settings in your "
-            "local .env file before processing a PDF."
-        )
-    if st.session_state.document_names:
-        st.caption("Selected PDFs")
-        for document_name in st.session_state.document_names:
-            st.text(document_name)
+    st.header("Your account")
+    st.text(display_name)
+    st.caption(f"{user_email} · {role}")
     st.button(
-        "Reset PDFs",
-        icon=":material/delete:",
+        "Sign out",
+        icon=":material/logout:",
+        on_click=sign_out,
+        width="stretch",
+    )
+    st.button(
+        "Clear selection and chat",
+        icon=":material/refresh:",
         on_click=reset_document,
         width="stretch",
     )
-
-    upload_key = f"pdf_upload_{st.session_state.upload_widget_version}"
-    uploaded_files = st.file_uploader(
-        "Upload PDFs",
-        type=["pdf"],
-        accept_multiple_files=True,
-        key=upload_key,
-        help=(
-            f"Choose up to {MAX_DOCUMENTS_PER_UPLOAD} PDFs. Each file can be up to "
-            "25 MB by default; the combined default limit is 100 MB."
-        ),
+    st.divider()
+    st.header("Shared PDF library")
+    st.info(
+        "PDF text and questions are sent to the configured Bosch LLM Farm. "
+        "Upload only documents approved for this service."
     )
 
-uploaded_documents = (
-    tuple((uploaded_file.name, uploaded_file.getvalue()) for uploaded_file in uploaded_files)
-    if uploaded_files
-    else ()
+    try:
+        max_file_bytes, max_total_bytes = configured_upload_limits()
+    except ValueError as exc:
+        st.error(str(exc))
+        st.stop()
+    if role == "admin":
+        with st.form("admin_pdf_upload_form", clear_on_submit=True):
+            uploaded_files = st.file_uploader(
+                "Add PDFs to the shared library",
+                type=["pdf"],
+                accept_multiple_files=True,
+                max_upload_size=max(1, max_file_bytes // (1024 * 1024)),
+                help=(
+                    f"Up to {MAX_DOCUMENTS_PER_UPLOAD} PDFs; "
+                    f"{max_file_bytes // (1024 * 1024)} MB per file and "
+                    f"{max_total_bytes // (1024 * 1024)} MB total."
+                ),
+            )
+            publish_documents = st.form_submit_button(
+                "Publish to library",
+                icon=":material/library_add:",
+                type="primary",
+                width="stretch",
+            )
+        if publish_documents:
+            if not uploaded_files:
+                st.error("Choose at least one PDF to publish.")
+            else:
+                try:
+                    uploads = tuple(
+                        (uploaded_file.name, uploaded_file.getvalue())
+                        for uploaded_file in uploaded_files
+                    )
+                    inserted_ids, existing_ids, duplicate_count = save_documents(
+                        database_path(),
+                        uploads,
+                        user_email,
+                        is_admin=(role == "admin"),
+                        max_file_bytes=max_file_bytes,
+                        max_total_bytes=max_total_bytes,
+                        max_documents=MAX_DOCUMENTS_PER_UPLOAD,
+                    )
+                    st.session_state.selected_document_ids = list(
+                        dict.fromkeys(inserted_ids + existing_ids)
+                    )
+                    if inserted_ids:
+                        st.success(f"Published {len(inserted_ids)} PDF(s).")
+                    if existing_ids:
+                        st.info(f"{len(existing_ids)} PDF(s) were already in the library.")
+                    if duplicate_count:
+                        st.caption(
+                            f"Ignored {duplicate_count} duplicate file(s) in this upload."
+                        )
+                    st.rerun()
+                except (PDFChatError, ValueError, PermissionError) as exc:
+                    st.error(str(exc))
+                except (OSError, sqlite3.Error):
+                    st.error(
+                        "The shared library could not save the PDFs. Check the "
+                        "configured storage path and permissions, then try again."
+                    )
+    elif not parse_csv_values(os.getenv("PDF_CHAT_ADMIN_EMAILS")):
+        st.warning("No administrators are configured; PDF uploads are disabled.")
+
+try:
+    library_documents = list_documents(database_path())
+except (OSError, sqlite3.Error):
+    st.error(
+        "The shared PDF library is unavailable. Check the configured storage "
+        "path and permissions."
+    )
+    st.stop()
+
+document_by_id: dict[str, LibraryDocument] = {
+    document.document_id: document for document in library_documents
+}
+valid_document_ids = set(document_by_id)
+st.session_state.selected_document_ids = [
+    document_id
+    for document_id in st.session_state.selected_document_ids
+    if document_id in valid_document_ids
+]
+
+if not library_documents:
+    st.info("The shared PDF library is empty. An administrator must publish PDFs first.")
+    selected_ids: tuple[str, ...] = ()
+else:
+    selected_ids = tuple(
+        st.multiselect(
+            "Choose PDFs to chat with",
+            options=tuple(document_by_id),
+            key="selected_document_ids",
+            format_func=lambda document_id: (
+                f"{document_by_id[document_id].document_name} · {document_id[:8]}"
+            ),
+            max_selections=MAX_DOCUMENTS_PER_UPLOAD,
+            help="All selected PDFs are searched together. Page numbers restart for each file.",
+        )
+    )
+
+selected_set_id = (
+    document_set_id(
+        tuple(
+            (document_id, document_by_id[document_id].document_name)
+            for document_id in selected_ids
+        )
+    )
+    if selected_ids
+    else None
 )
 
-if uploaded_documents:
-    uploaded_id = document_bundle_id(uploaded_documents)
-    if st.session_state.document_id != uploaded_id:
-        clear_document_state()
-        st.session_state.document_id = uploaded_id
-        process_upload(uploaded_documents, uploaded_id)
-elif st.session_state.document_id is not None:
+if selected_set_id is None:
     clear_document_state()
+    st.info("Select one or more library PDFs to start a chat.")
+elif st.session_state.document_id != selected_set_id:
+    clear_document_state()
+    st.session_state.document_id = selected_set_id
+    try:
+        selected_documents = get_documents(database_path(), selected_ids)
+        with st.status("Preparing the selected PDFs...", expanded=False) as progress:
+            progress.update(label="Extracting and indexing selected PDFs...")
+            process_selected_documents(selected_documents, selected_set_id)
+            if st.session_state.status == "ready":
+                progress.update(label="PDFs ready", state="complete")
+            else:
+                progress.update(label="PDF processing failed", state="error", expanded=True)
+    except (OSError, sqlite3.Error, LookupError, ValueError) as exc:
+        show_processing_error(exc)
 
 if st.session_state.status == "ready":
     st.success(
@@ -362,22 +570,14 @@ if st.session_state.status == "ready":
         f"{st.session_state.document_name} "
         f"({len(st.session_state.pages)} pages, {len(st.session_state.chunks)} chunks)."
     )
-    if st.session_state.get("duplicate_document_count", 0):
-        st.caption(
-            f"Ignored {st.session_state.duplicate_document_count} duplicate upload(s)."
-        )
 elif st.session_state.status == "error":
-    st.error(st.session_state.error_message or "The PDF could not be processed.")
-elif st.session_state.status in {"validating", "extracting", "indexing"}:
-    st.info(f"Document status: {st.session_state.status}.")
-elif not uploaded_files:
-    st.info("Upload one or more PDFs in the sidebar to get started.")
+    st.error(st.session_state.error_message or "The selected PDFs could not be processed.")
 
 for chat_message in st.session_state.messages:
     render_message(chat_message)
 
 question = st.chat_input(
-    "Ask a question about the uploaded PDF",
+    "Ask a question about the selected PDFs",
     disabled=st.session_state.status != "ready",
 )
 if question:
@@ -397,7 +597,7 @@ if question:
                 farm.api_key,
             )
             with st.chat_message("assistant"):
-                with st.spinner("Searching the PDF and checking its evidence..."):
+                with st.spinner("Searching the selected PDFs and checking evidence..."):
                     answer = answer_question(
                         question,
                         previous_messages,

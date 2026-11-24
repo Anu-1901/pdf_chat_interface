@@ -15,7 +15,8 @@ description: validate one or multiple uploaded PDFs before processing. use when 
 
 ## Rules
 - Sanitize the filename for display and logs.
-- Do not persist uploads unless the product explicitly requires it.
+- Persist uploads only when the feature explicitly requires a shared library, and only after the complete selected set has passed validation and authorization.
+- For a shared-library feature, restrict writes to the authenticated admin role, use the configured protected storage, and never use upload filenames as filesystem paths.
 - Clear previous index, sources, and chat state whenever the selected PDF set changes or is removed.
 - Handle encrypted, malformed, and parser-rejected PDFs without exposing stack traces.
 

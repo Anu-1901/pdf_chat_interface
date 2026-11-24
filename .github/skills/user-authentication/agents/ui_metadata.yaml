@@ -1,0 +1,4 @@
+interface:
+  display_name: "User Authentication"
+  short_description: "OIDC login and admin/user access controls for the shared PDF library"
+  brand_color: "#2563EB"
